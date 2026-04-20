@@ -180,8 +180,8 @@ function! s:set_errors_to_location_list() abort
     endtry
 endfunction
 
-function! s:set_errors_from_xml_string(xml) abort
-    let b:grammarous_result = grammarous#get_errors_from_xml(s:XML.parse(substitute(a:xml, "\n", '', 'g')))
+function! s:set_errors_from_output(output) abort
+    let b:grammarous_result = grammarous#get_errors_from_json(a:output)
     let parsed = s:last_parsed_options
 
     if s:is_comment_only(parsed['comments-only'])
@@ -220,14 +220,14 @@ function! s:set_errors_from_xml_string(xml) abort
 endfunction
 
 function! s:on_check_done_vim8(channel) abort
-    let xml = ''
+    let output = ''
     while ch_status(a:channel, {'part' : 'out'}) ==# 'buffered'
-        let xml .= ch_read(a:channel)
+        let output .= ch_read(a:channel)
     endwhile
-    if xml ==# ''
+    if output ==# ''
         return
     endif
-    call s:set_errors_from_xml_string(xml)
+    call s:set_errors_from_output(output)
 endfunction
 
 function! s:on_check_exit_vim8(channel, status) abort
@@ -247,7 +247,7 @@ function! s:on_exit_nvim(job, status, event) abort dict
         return
     endif
 
-    call s:set_errors_from_xml_string(self._stdout)
+    call s:set_errors_from_output(self._stdout)
 endfunction
 
 function! s:on_output_nvim(job, lines, event) abort dict
@@ -294,12 +294,14 @@ function! s:invoke_check(range_start, ...)
         silent echon text
     redir END
 
+    let s:last_checked_content = readfile(tmpfile)
+
     if s:is_cygwin
         let tmpfile = s:cygpath(tmpfile)
     endif
 
     let cmdargs = printf(
-            \   '-c %s -l %s --api %s',
+            \   '-c %s -l %s --json %s',
             \   &fileencoding ? &fileencoding : &encoding,
             \   lang,
             \   substitute(tmpfile, '\\\s\@!', '\\\\', 'g')
@@ -350,14 +352,14 @@ function! s:invoke_check(range_start, ...)
         return
     endif
 
-    let xml = s:P.system(cmd)
+    let output = s:P.system(cmd)
     call delete(tmpfile)
 
     if s:P.get_last_status()
-        call grammarous#error("Command '%s' failed:\n%s", cmd, xml)
+        call grammarous#error("Command '%s' failed:\n%s", cmd, output)
         return
     endif
-    call s:set_errors_from_xml_string(xml)
+    call s:set_errors_from_output(output)
 endfunction
 
 function! s:sanitize(s)
@@ -390,6 +392,70 @@ endfunction
 
 function! grammarous#get_errors_from_xml(xml)
     return map(filter(a:xml.childNodes(), 'v:val.name ==# "error"'), 's:unescape_error(v:val.attr)')
+endfunction
+
+function! s:offset_to_pos(lines, offset)
+    let remaining = a:offset
+    let idx = 0
+    while idx < len(a:lines)
+        let lc = strchars(a:lines[idx])
+        if remaining <= lc
+            return [idx, remaining]
+        endif
+        let remaining -= lc + 1
+        let idx += 1
+    endwhile
+    return [idx, remaining]
+endfunction
+
+function! grammarous#get_errors_from_json(json_str)
+    " LanguageTool prints a status preamble (e.g. "Expected text language: ...")
+    " to stderr, which Vim's system() merges into stdout via &shellredir.
+    " Skip to the first '{' so json_decode sees only the JSON body.
+    let start = stridx(a:json_str, '{')
+    if start < 0
+        return []
+    endif
+    try
+        let parsed = json_decode(a:json_str[start :])
+    catch
+        return []
+    endtry
+    if type(parsed) != type({}) || !has_key(parsed, 'matches')
+        return []
+    endif
+
+    let lines = exists('s:last_checked_content') ? s:last_checked_content : []
+    let errors = []
+    for m in parsed.matches
+        let length = m.length
+        let [fromy, fromx] = s:offset_to_pos(lines, m.offset)
+        let [toy, tox] = s:offset_to_pos(lines, m.offset + length)
+
+        let replacements = []
+        for r in get(m, 'replacements', [])
+            call add(replacements, r.value)
+        endfor
+
+        let rule = get(m, 'rule', {})
+        let context = get(m, 'context', {})
+        let err = {
+            \   'fromy': fromy,
+            \   'fromx': fromx,
+            \   'toy': toy,
+            \   'tox': tox,
+            \   'msg': get(m, 'message', ''),
+            \   'replacements': join(replacements, '#'),
+            \   'context': get(context, 'text', ''),
+            \   'contextoffset': get(context, 'offset', 0),
+            \   'errorlength': length,
+            \   'ruleId': get(rule, 'id', ''),
+            \   'subId': get(rule, 'subId', ''),
+            \   'category': get(get(rule, 'category', {}), 'name', ''),
+            \ }
+        call add(errors, err)
+    endfor
+    return errors
 endfunction
 
 function! s:matcherrpos(...)
